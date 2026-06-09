@@ -11,8 +11,8 @@ phases:
     commands:
       - echo Logging in to Amazon ECR...
       - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "${REPOSITORY_URI%/*}"
-      - IMAGE_TAG="${CODEBUILD_RESOLVED_SOURCE_VERSION:-latest}"
-      - IMAGE_TAG="${IMAGE_TAG:0:8}"
+      # POSIX sh (CodeBuild uses /bin/sh) has no ${var:0:8} substring syntax.
+      - IMAGE_TAG=$(echo "${CODEBUILD_RESOLVED_SOURCE_VERSION:-latest}" | cut -c1-8)
       - echo "Image tag is $IMAGE_TAG"
   build:
     commands:
