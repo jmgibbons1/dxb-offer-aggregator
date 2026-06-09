@@ -6,6 +6,8 @@ import {
   saveCategories,
   getCategories,
   saveOffers,
+  saveSubcategories,
+  getSubcategories,
   queryOffers,
   getOfferStats,
   getMeta,
@@ -48,22 +50,39 @@ app.get('/api/categories', async (_req, res) => {
 
 // Download the full offer set from upstream into the SQLite cache.
 async function refreshOffers() {
-  const { offers, total } = await fetchAllOffers();
+  const { offers, total, subcategories } = await fetchAllOffers();
   const lastRefreshed = saveOffers(offers);
-  console.log(`Cached ${offers.length}/${total} offers at ${lastRefreshed}`);
+  saveSubcategories(subcategories);
+  console.log(
+    `Cached ${offers.length}/${total} offers and ${subcategories.length} subcategories at ${lastRefreshed}`
+  );
   return offers;
 }
+
+// Subcategories from the cache, optionally scoped to one category.
+//   ?categoryId=<id>     only subcategories under that category
+app.get('/api/subcategories', (req, res) => {
+  res.json({ subcategories: getSubcategories(req.query.categoryId), meta: getMeta() });
+});
 
 // Search/filter offers from the cache.
 //   ?q=<text>            global search over brand, title, description
 //   ?categoryId=<id>     only offers tagged with that category
+//   ?subCategoryId=<id>  only offers tagged with that subcategory
 //   ?minDiscount=<n>     only offers with discount >= n  (e.g. 50)
+//   ?lat=&lng=&radiusKm= only offers with a venue within radiusKm of (lat,lng),
+//                        annotated with distanceKm and sorted nearest-first
 // Cold-fetches the full set if the cache is empty.
 app.get('/api/offers', async (req, res) => {
+  const num = (v) => (v == null || v === '' ? undefined : Number(v));
   const filters = {
     q: req.query.q ?? '',
     categoryId: req.query.categoryId,
+    subCategoryId: req.query.subCategoryId,
     minDiscount: Number(req.query.minDiscount) || 0,
+    lat: num(req.query.lat),
+    lng: num(req.query.lng),
+    radiusKm: num(req.query.radiusKm),
   };
   try {
     if (getOfferStats().total === 0) {

@@ -46,6 +46,14 @@ export async function fetchCategories() {
 
 const abs = (path) => (path ? `${BASE_URL}${path}` : '');
 
+// Upstream contact websites are often bare hosts ("www.radissonblu.com") with no
+// scheme, which browsers treat as a relative path. Force an absolute https URL.
+const httpUrl = (url) => {
+  const u = String(url ?? '').trim();
+  if (!u) return '';
+  return /^https?:\/\//i.test(u) ? u : `https://${u}`;
+};
+
 // Flatten one raw offer (offerData + envelope fields) into a stored row.
 function normaliseOffer(offer) {
   const d = offer.offerData ?? {};
@@ -57,65 +65,144 @@ function normaliseOffer(offer) {
     title: d.title ?? '',
     shortDescription: d.shortDescription ?? '',
     discount: offer.discount ?? '',
-    website: d.offerContactWebsite ?? '',
+    website: httpUrl(d.offerContactWebsite),
     telephone: d.offerContactTelephone ?? '',
     email: d.offerContactEmail ?? '',
     validFrom: v.validFrom ?? '',
     validTo: v.validTo ?? '',
     image: abs(Array.isArray(d.images) ? d.images[0] : ''),
-    // The offer's true category membership (an offer can belong to several).
+    // Geocoded venue locations (an offer can have several). Coords arrive as
+    // strings; keep only entries that parse to finite numbers.
+    locations: Array.isArray(d.locationDetails)
+      ? d.locationDetails
+          .map((l) => ({
+            address: l.address ?? '',
+            lat: parseFloat(l.latitude),
+            lng: parseFloat(l.longitude),
+          }))
+          .filter((l) => Number.isFinite(l.lat) && Number.isFinite(l.lng))
+      : [],
+    // The offer's true membership (an offer can belong to several of each).
     categoryIds: Array.isArray(d.categoryIds) ? d.categoryIds : [],
+    subcategoryIds: Array.isArray(d.subcategories)
+      ? d.subcategories.map((s) => s.id).filter((id) => id != null)
+      : [],
     raw: offer, // full payload, for a detail view later
   };
 }
 
-// Fetch ALL offers in the programme, paging until we've collected the reported
-// total. The upstream "alloffers" listing ignores categoryId and returns the
-// full set; each offer carries its own categoryIds. Returns { offers, total }.
-export async function fetchAllOffers(pageSize = 50) {
-  const collected = [];
-  let total = Infinity;
-  for (let page = 1; collected.length < total; page++) {
-    const body = {
-      pageType: 'alloffers',
-      currentPageNo: page,
-      pageSize,
-      isHeaderRequired: true,
-      categoryId: 0,
-      keyword: '',
-      categoryName: '',
-      subCategoryId: '',
-      subCategoryName: '',
-      subCategoryCount: 0,
-      offerId: '',
-      locationKeyword: '',
-      sortBy: '',
-      brands: [],
-      features: [],
-      specialOffer: false,
-      minDiscount: 5,
-      maxDiscount: 50,
-      isFilterApplied: false,
-      latitude: 0,
-      longitude: 0,
-    };
-    const res = await fetch(OFFERS_URL, {
-      method: 'POST',
-      headers: { ...HEADERS, 'content-type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) throw new Error(`Upstream GetOfferListing failed: HTTP ${res.status}`);
-    const raw = await res.json();
+// A pageSize large enough that every nested subcategory bucket returns in full.
+// The biggest subcategory currently holds a few hundred offers; this leaves headroom.
+const CATEGORY_PAGE_SIZE = 2000;
+
+// Strip a trailing "(123)" count off a subcategory display name.
+const stripCount = (name) => String(name ?? '').replace(/\s*\(\d+\)\s*$/, '').trim();
+
+function offerListingBody(overrides) {
+  return {
+    pageType: 'alloffers',
+    currentPageNo: 1,
+    pageSize: CATEGORY_PAGE_SIZE,
+    isHeaderRequired: true,
+    categoryId: 0,
+    keyword: '',
+    categoryName: '',
+    subCategoryId: '',
+    subCategoryName: '',
+    subCategoryCount: 0,
+    offerId: '',
+    locationKeyword: '',
+    sortBy: '',
+    brands: [],
+    features: [],
+    specialOffer: false,
+    // No discount band: the captured curls used 5–50, which silently drops every
+    // offer outside that range. 0–100 returns the whole catalogue.
+    minDiscount: 0,
+    maxDiscount: 100,
+    isFilterApplied: false,
+    latitude: 0,
+    longitude: 0,
+    ...overrides,
+  };
+}
+
+async function postOfferListing(body) {
+  const res = await fetch(OFFERS_URL, {
+    method: 'POST',
+    headers: { ...HEADERS, 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`Upstream GetOfferListing failed: HTTP ${res.status}`);
+  return res.json();
+}
+
+// Fetch the ENTIRE offer catalogue.
+//
+// The "alloffers" listing only returns a small curated subset (~119 offers) and
+// ignores the discount band, so it can't be used for a full download. Instead we
+// sweep every category with pageType "category": that response nests each
+// category's offers under its subcategories (subCategories[].subCategoryOffers[]),
+// plus a flat categoryOffers list for categories that have no subcategories (e.g.
+// Star Deals). A large pageSize makes each nested bucket return in full.
+//
+// Offers routinely belong to several categories/subcategories, so we dedupe by id.
+// Returns { offers, total, subcategories } where subcategories is the taxonomy
+// (id, categoryId, name, count) discovered during the sweep.
+export async function fetchAllOffers() {
+  const { categories } = await fetchCategories();
+  const byId = new Map(); // offer id -> normalised offer
+  const membership = new Map(); // offer id -> Set of subcategory ids it was listed under
+  const subcats = new Map(); // subcategory id -> { id, categoryId, name, count }
+
+  const addToBucket = (id, subId) => {
+    if (!membership.has(id)) membership.set(id, new Set());
+    if (subId != null) membership.get(id).add(subId);
+  };
+
+  for (const cat of categories) {
+    const raw = await postOfferListing(
+      offerListingBody({ pageType: 'category', categoryId: cat.id, categoryName: cat.name })
+    );
     const bucket = raw?.responseModel?.data?.offers?.[0];
-    const pageOffers = bucket?.categoryOffers;
-    if (!Array.isArray(pageOffers)) {
-      throw new Error('Unexpected GetOfferListing response shape');
+    if (!bucket) {
+      throw new Error(`Unexpected GetOfferListing response for category ${cat.id}`);
     }
-    total = bucket.categoryOffercount ?? pageOffers.length;
-    collected.push(...pageOffers.map((o) => normaliseOffer(o)));
-    if (pageOffers.length === 0) break; // safety: stop if a page is empty
+
+    // Flat offers — categories with no subcategories surface them here.
+    for (const o of bucket.categoryOffers ?? []) {
+      if (!byId.has(o.id)) byId.set(o.id, normaliseOffer(o));
+      addToBucket(o.id, null);
+    }
+
+    // Offers nested under each subcategory.
+    for (const sub of bucket.subCategories ?? []) {
+      const subId = sub.subCategoryId;
+      if (subId != null && !subcats.has(subId)) {
+        const parsed = String(sub.subCategoryName ?? '').match(/\((\d+)\)\s*$/);
+        subcats.set(subId, {
+          id: subId,
+          categoryId: cat.id,
+          name: stripCount(sub.subCategoryName),
+          count: parsed ? parseInt(parsed[1], 10) : sub.subCategoryOffers?.length ?? 0,
+        });
+      }
+      for (const o of sub.subCategoryOffers ?? []) {
+        if (!byId.has(o.id)) byId.set(o.id, normaliseOffer(o));
+        addToBucket(o.id, subId);
+      }
+    }
   }
-  return { offers: collected, total };
+
+  // Union the bucket membership into each offer's subcategoryIds. An offer's own
+  // offerData.subcategories is sometimes narrower than the buckets it actually
+  // appears in, so the buckets are the more complete source of truth.
+  const offers = [...byId.values()].map((o) => {
+    const ids = new Set(o.subcategoryIds);
+    for (const id of membership.get(o.id) ?? []) ids.add(id);
+    return { ...o, subcategoryIds: [...ids] };
+  });
+  return { offers, total: offers.length, subcategories: [...subcats.values()] };
 }
 
 export { BASE_URL };

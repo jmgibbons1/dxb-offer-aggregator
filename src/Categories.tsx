@@ -14,21 +14,23 @@ interface ApiResponse {
   warning?: string;
 }
 
-export default function Categories() {
+interface CategoriesProps {
+  onSelect: (category: { id: number; name: string }) => void;
+  onNearMe: () => void;
+  onSearch: (query: string) => void;
+}
+
+export default function Categories({ onSelect, onNearMe, onSearch }: CategoriesProps) {
   const [categories, setCategories] = useState<Category[]>([]);
   const [meta, setMeta] = useState<ApiResponse['meta']>();
   const [status, setStatus] = useState<'loading' | 'ready' | 'error'>('loading');
   const [message, setMessage] = useState('');
-  const [refreshing, setRefreshing] = useState(false);
+  const [search, setSearch] = useState('');
 
-  async function load(refresh = false) {
+  async function load() {
     try {
-      refresh ? setRefreshing(true) : setStatus('loading');
-      // GET reads the SQLite cache; POST forces a live re-fetch from upstream.
-      const r = await fetch(
-        refresh ? '/api/refresh' : '/api/categories',
-        refresh ? { method: 'POST' } : undefined
-      );
+      setStatus('loading');
+      const r = await fetch('/api/categories');
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const data: ApiResponse = await r.json();
       setCategories(data.categories);
@@ -38,8 +40,6 @@ export default function Categories() {
     } catch (err) {
       setStatus('error');
       setMessage(err instanceof Error ? err.message : String(err));
-    } finally {
-      setRefreshing(false);
     }
   }
 
@@ -56,10 +56,30 @@ export default function Categories() {
             ? ` · updated ${new Date(meta.last_refreshed).toLocaleString()}`
             : ''}
         </p>
-        <button className="refresh" onClick={() => load(true)} disabled={refreshing}>
-          {refreshing ? 'Refreshing…' : 'Refresh from API'}
+        <button className="near-me" onClick={onNearMe}>
+          📍 Offers near me
         </button>
       </div>
+
+      <form
+        className="filters"
+        onSubmit={(e) => {
+          e.preventDefault();
+          const q = search.trim();
+          if (q) onSearch(q);
+        }}
+      >
+        <input
+          className="search"
+          type="search"
+          placeholder="Search all offers across every category…"
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+        />
+        <button className="near-me" type="submit" disabled={!search.trim()}>
+          Search
+        </button>
+      </form>
 
       {message && <p className="warning">{message}</p>}
       {status === 'loading' && <p className="state">Loading categories…</p>}
@@ -68,7 +88,16 @@ export default function Categories() {
       {status === 'ready' && (
         <ul className="list">
           {categories.map((c) => (
-            <li key={c.id} className="row">
+            <li
+              key={c.id}
+              className="row clickable"
+              onClick={() => onSelect({ id: c.id, name: c.name })}
+              role="button"
+              tabIndex={0}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') onSelect({ id: c.id, name: c.name });
+              }}
+            >
               {c.image ? (
                 <img className="thumb" src={c.image} alt="" loading="lazy" />
               ) : (
@@ -81,7 +110,7 @@ export default function Categories() {
                 </div>
                 {c.tooltip && <p className="tooltip">{c.tooltip}</p>}
               </div>
-              <span className="id">#{c.id}</span>
+              <span className="chevron">›</span>
             </li>
           ))}
         </ul>

@@ -9,11 +9,16 @@ const DB_PATH = join(__dirname, 'categories.db');
 const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
 
-// Migration: the offers cache used to be keyed by a single category_id. Offers
-// are actually tagged with many categories, so the table now stores category_ids
-// (JSON) + a numeric discount. Drop the disposable old cache so it re-downloads.
+// Migration: the offers cache schema has changed twice. It used to be keyed by a
+// single category_id (offers are actually tagged with many categories → category_ids
+// JSON), and now also stores subcategory_ids. The cache is disposable, so whenever a
+// required column is missing we drop it and let it re-download from upstream.
 const offerCols = db.prepare(`PRAGMA table_info(offers)`).all();
-if (offerCols.length && !offerCols.some((c) => c.name === 'category_ids')) {
+const hasCol = (name) => offerCols.some((c) => c.name === name);
+if (
+  offerCols.length &&
+  (!hasCol('category_ids') || !hasCol('subcategory_ids') || !hasCol('locations'))
+) {
   db.exec('DROP TABLE IF EXISTS offers');
 }
 
@@ -29,6 +34,7 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS offers (
     id                INTEGER PRIMARY KEY,
     category_ids      TEXT NOT NULL DEFAULT '[]',
+    subcategory_ids   TEXT NOT NULL DEFAULT '[]',
     brand_name        TEXT NOT NULL DEFAULT '',
     brand_logo        TEXT NOT NULL DEFAULT '',
     title             TEXT NOT NULL DEFAULT '',
@@ -41,8 +47,16 @@ db.exec(`
     valid_from        TEXT NOT NULL DEFAULT '',
     valid_to          TEXT NOT NULL DEFAULT '',
     image             TEXT NOT NULL DEFAULT '',
+    locations         TEXT NOT NULL DEFAULT '[]',
     raw               TEXT NOT NULL DEFAULT '{}',
     updated_at        TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS subcategories (
+    id          INTEGER PRIMARY KEY,
+    category_id INTEGER NOT NULL,
+    name        TEXT NOT NULL,
+    offer_count INTEGER NOT NULL DEFAULT 0,
+    updated_at  TEXT NOT NULL
   );
   CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -96,16 +110,17 @@ export function getCategories() {
 
 const upsertOfferStmt = db.prepare(`
   INSERT INTO offers (
-    id, category_ids, brand_name, brand_logo, title,
+    id, category_ids, subcategory_ids, brand_name, brand_logo, title,
     short_description, discount, discount_num, website, telephone, email,
-    valid_from, valid_to, image, raw, updated_at
+    valid_from, valid_to, image, locations, raw, updated_at
   ) VALUES (
-    @id, @categoryIds, @brandName, @brandLogo, @title,
+    @id, @categoryIds, @subcategoryIds, @brandName, @brandLogo, @title,
     @shortDescription, @discount, @discountNum, @website, @telephone, @email,
-    @validFrom, @validTo, @image, @raw, @updatedAt
+    @validFrom, @validTo, @image, @locations, @raw, @updatedAt
   )
   ON CONFLICT(id) DO UPDATE SET
     category_ids = excluded.category_ids,
+    subcategory_ids = excluded.subcategory_ids,
     brand_name = excluded.brand_name,
     brand_logo = excluded.brand_logo,
     title = excluded.title,
@@ -118,6 +133,7 @@ const upsertOfferStmt = db.prepare(`
     valid_from = excluded.valid_from,
     valid_to = excluded.valid_to,
     image = excluded.image,
+    locations = excluded.locations,
     raw = excluded.raw,
     updated_at = excluded.updated_at
 `);
@@ -137,6 +153,8 @@ export function saveOffers(offers) {
       upsertOfferStmt.run({
         ...o,
         categoryIds: JSON.stringify(o.categoryIds ?? []),
+        subcategoryIds: JSON.stringify(o.subcategoryIds ?? []),
+        locations: JSON.stringify(o.locations ?? []),
         discountNum: discountToNum(o.discount),
         raw: JSON.stringify(o.raw ?? {}),
         updatedAt,
@@ -153,6 +171,7 @@ function rowToOffer(r) {
   return {
     id: r.id,
     categoryIds: JSON.parse(r.category_ids || '[]'),
+    subcategoryIds: JSON.parse(r.subcategory_ids || '[]'),
     brandName: r.brand_name,
     brandLogo: r.brand_logo,
     title: r.title,
@@ -165,12 +184,44 @@ function rowToOffer(r) {
     validFrom: r.valid_from,
     validTo: r.valid_to,
     image: r.image,
+    locations: JSON.parse(r.locations || '[]'),
   };
+}
+
+// Great-circle distance in km between two lat/lng points (haversine).
+function distanceKm(lat1, lng1, lat2, lng2) {
+  const R = 6371;
+  const toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+
+// The nearest of an offer's locations to a point, as { distanceKm, location },
+// or null when the offer has no locations.
+function nearestLocation(locations, lat, lng) {
+  let best = null;
+  for (const loc of locations) {
+    const d = distanceKm(lat, lng, loc.lat, loc.lng);
+    if (best == null || d < best.distanceKm) best = { distanceKm: d, location: loc };
+  }
+  return best;
 }
 
 // Query the offer cache with optional global text search, category filter, and
 // minimum discount. All filters combine (AND).
-export function queryOffers({ q = '', categoryId, minDiscount = 0 } = {}) {
+export function queryOffers({
+  q = '',
+  categoryId,
+  subCategoryId,
+  minDiscount = 0,
+  lat,
+  lng,
+  radiusKm,
+} = {}) {
   const where = [];
   const params = {};
 
@@ -188,24 +239,95 @@ export function queryOffers({ q = '', categoryId, minDiscount = 0 } = {}) {
     where.push(`(',' || REPLACE(REPLACE(category_ids, '[', ''), ']', '') || ',') LIKE @cat`);
     params.cat = `%,${Number(categoryId)},%`;
   }
+  // subcategory_ids matched the same whole-token way.
+  if (subCategoryId != null && subCategoryId !== '') {
+    where.push(`(',' || REPLACE(REPLACE(subcategory_ids, '[', ''), ']', '') || ',') LIKE @sub`);
+    params.sub = `%,${Number(subCategoryId)},%`;
+  }
 
   const sql =
     'SELECT * FROM offers' +
     (where.length ? ` WHERE ${where.join(' AND ')}` : '') +
     ' ORDER BY discount_num DESC, brand_name COLLATE NOCASE';
-  return db.prepare(sql).all(params).map(rowToOffer);
+  const rows = db.prepare(sql).all(params).map(rowToOffer);
+
+  // No location supplied → return as-is.
+  const hasPoint = Number.isFinite(lat) && Number.isFinite(lng);
+  if (!hasPoint) return rows;
+
+  // Annotate every offer with the distance to its nearest venue so each card can
+  // show how far away it is (offers with no coordinates get distanceKm = null).
+  const annotated = rows.map((o) => {
+    const near = nearestLocation(o.locations, lat, lng);
+    return near
+      ? { ...o, distanceKm: near.distanceKm, nearestLocation: near.location }
+      : { ...o, distanceKm: null, nearestLocation: null };
+  });
+
+  // A radius means "near me" mode: keep only offers in range, sorted closest-first.
+  // Without a radius we only annotate, preserving the default (discount) ordering.
+  if (Number.isFinite(radiusKm) && radiusKm > 0) {
+    return annotated
+      .filter((o) => o.distanceKm != null && o.distanceKm <= radiusKm)
+      .sort((a, b) => a.distanceKm - b.distanceKm);
+  }
+  return annotated;
 }
 
-// Total cached offers, and counts per category id.
+// Total cached offers, and counts per category and per subcategory id.
 export function getOfferStats() {
-  const rows = db.prepare('SELECT category_ids FROM offers').all();
+  const rows = db.prepare('SELECT category_ids, subcategory_ids FROM offers').all();
   const byCategory = {};
+  const bySubcategory = {};
   for (const r of rows) {
     for (const id of JSON.parse(r.category_ids || '[]')) {
       byCategory[id] = (byCategory[id] || 0) + 1;
     }
+    for (const id of JSON.parse(r.subcategory_ids || '[]')) {
+      bySubcategory[id] = (bySubcategory[id] || 0) + 1;
+    }
   }
-  return { total: rows.length, byCategory };
+  return { total: rows.length, byCategory, bySubcategory };
+}
+
+const upsertSubcategoryStmt = db.prepare(`
+  INSERT INTO subcategories (id, category_id, name, offer_count, updated_at)
+  VALUES (@id, @categoryId, @name, @count, @updatedAt)
+  ON CONFLICT(id) DO UPDATE SET
+    category_id = excluded.category_id,
+    name = excluded.name,
+    offer_count = excluded.offer_count,
+    updated_at = excluded.updated_at
+`);
+
+// Replace the cached subcategory taxonomy with a fresh sweep.
+export function saveSubcategories(subcategories) {
+  const updatedAt = new Date().toISOString();
+  const tx = db.transaction((rows) => {
+    db.prepare('DELETE FROM subcategories').run();
+    for (const s of rows) {
+      upsertSubcategoryStmt.run({ ...s, updatedAt });
+    }
+    setMetaStmt.run('subcategories_count', String(rows.length));
+  });
+  tx(subcategories);
+  return updatedAt;
+}
+
+export function getSubcategories(categoryId) {
+  const sql =
+    'SELECT id, category_id, name, offer_count FROM subcategories' +
+    (categoryId != null && categoryId !== '' ? ' WHERE category_id = @categoryId' : '') +
+    ' ORDER BY name COLLATE NOCASE';
+  return db
+    .prepare(sql)
+    .all(categoryId != null && categoryId !== '' ? { categoryId: Number(categoryId) } : {})
+    .map((r) => ({
+      id: r.id,
+      categoryId: r.category_id,
+      name: r.name,
+      offerCount: r.offer_count,
+    }));
 }
 
 export function getMeta() {

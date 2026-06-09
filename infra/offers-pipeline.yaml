@@ -86,6 +86,19 @@ Resources:
         - Key: Name
           Value: offers-service-sg
 
+  # The shared ALB's security group has restricted egress, so it can't reach a
+  # new target port by default. Allow it to reach this service on the container
+  # port (independent rule on the existing SG; removed cleanly on teardown).
+  AlbEgressToService:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref AlbSecurityGroupId
+      IpProtocol: tcp
+      FromPort: !Ref ContainerPort
+      ToPort: !Ref ContainerPort
+      DestinationSecurityGroupId: !Ref ServiceSecurityGroup
+      Description: offers - ALB to service on container port
+
   TargetGroup:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
@@ -177,7 +190,9 @@ Resources:
 
   Service:
     Type: AWS::ECS::Service
-    DependsOn: ListenerRule
+    DependsOn:
+      - ListenerRule
+      - AlbEgressToService
     Properties:
       Cluster: !Ref ClusterName
       LaunchType: FARGATE
