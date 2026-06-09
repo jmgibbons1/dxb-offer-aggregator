@@ -1,0 +1,5 @@
+node_modules/
+dist/
+server/categories.db
+server/categories.db-shm
+server/categories.db-wal

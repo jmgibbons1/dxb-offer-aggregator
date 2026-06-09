@@ -1,0 +1,31 @@
+version: 0.2
+
+# Builds the Docker image, pushes it to ECR, and emits imagedefinitions.json
+# for the CodePipeline ECS deploy stage.
+# Expected env vars (set on the CodeBuild project):
+#   REPOSITORY_URI  - full ECR repo URI (e.g. <acct>.dkr.ecr.eu-west-1.amazonaws.com/offers)
+#   CONTAINER_NAME  - container name in the ECS task definition (e.g. offers)
+
+phases:
+  pre_build:
+    commands:
+      - echo Logging in to Amazon ECR...
+      - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "${REPOSITORY_URI%/*}"
+      - IMAGE_TAG="${CODEBUILD_RESOLVED_SOURCE_VERSION:-latest}"
+      - IMAGE_TAG="${IMAGE_TAG:0:8}"
+      - echo "Image tag is $IMAGE_TAG"
+  build:
+    commands:
+      - echo Building the Docker image...
+      - docker build -t "$REPOSITORY_URI:$IMAGE_TAG" -t "$REPOSITORY_URI:latest" .
+  post_build:
+    commands:
+      - echo Pushing the Docker image...
+      - docker push "$REPOSITORY_URI:$IMAGE_TAG"
+      - docker push "$REPOSITORY_URI:latest"
+      - printf '[{"name":"%s","imageUri":"%s"}]' "$CONTAINER_NAME" "$REPOSITORY_URI:$IMAGE_TAG" > imagedefinitions.json
+      - cat imagedefinitions.json
+
+artifacts:
+  files:
+    - imagedefinitions.json

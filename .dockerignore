@@ -1,0 +1,10 @@
+node_modules
+dist
+.git
+.gitignore
+*.md
+server/categories.db
+server/categories.db-shm
+server/categories.db-wal
+/tmp
+infra/*.packaged.yaml
